@@ -7989,6 +7989,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
     GGML_TYPE_Q2_0,
+    GGML_TYPE_STQ1_0,
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
@@ -9046,6 +9047,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
+    }
+
+    // STQ1_0 MoE (PR #22836): expert-shaped mul_mat_id, incl. broadcast b
+    for (bool b : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_STQ1_0, GGML_TYPE_F32, 16, 16, b, 64, 8, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_STQ1_0, GGML_TYPE_F32, 128, 8, b, 512, 32, 2048));
     }
 
     for (ggml_type type_a : base_types) {
