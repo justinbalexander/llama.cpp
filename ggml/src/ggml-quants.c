@@ -2480,11 +2480,145 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * row_size;
 }
 
+// forward: defined after quantize_stq1_0 below
+void quantize_row_stq1_0_im(const float * GGML_RESTRICT x, block_stq1_0 * GGML_RESTRICT y, int64_t k, const float * GGML_RESTRICT im);
+
 size_t quantize_stq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    (void)quant_weights; // not used
     const size_t row_size = ggml_row_size(GGML_TYPE_STQ1_0, n_per_row);
-    quantize_row_stq1_0_ref(src, dst, (int64_t)nrow*n_per_row);
+    if (quant_weights != NULL) {
+        // imatrix-aware encoding: quant_weights[j] is the importance of input
+        // column j, shared across all rows (see quantize_row_stq1_0_im)
+        const int64_t blocks_per_row = row_size / sizeof(block_stq1_0);
+        for (int64_t r = 0; r < nrow; ++r) {
+            quantize_row_stq1_0_im(src + r*n_per_row, (block_stq1_0 *) dst + r*blocks_per_row, n_per_row, quant_weights);
+        }
+    } else {
+        quantize_row_stq1_0_ref(src, dst, (int64_t) nrow*n_per_row);
+    }
     return nrow * row_size;
+}
+
+// imatrix-aware STQ1_0 encoding.
+//
+// Semantic mapping of the importance matrix: llama-imatrix accumulates one
+// value per INPUT COLUMN of the weight matrix: im[j] = sum over tokens of
+// x[j]^2, the squared activations feeding column j. For a matmul row r, the
+// quantization error at the output from weight w[r][j] is dw[r][j]*x[j], so
+// the expected squared output error is sum_j im[j]*dw[r][j]^2. The per-weight
+// importance w[j] of the Hy4 formulas, applied to a row of the matrix, is
+// therefore exactly the column importance im[j]: one activation channel j
+// feeds every row, so its second moment weights the error of every weight in
+// column j identically. A block spans 256 consecutive columns of one row and
+// sees im[] at those 256 positions; a group of 4 (stride-16 lanes within a
+// 64-weight chunk) sees im[] at its four lane columns.
+//
+// Algorithm (Hy4 recipe): signs are fixed by sign(x). Zero placement starts
+// at min-|x| per group, then alternates 3 rounds of (a) weighted least-squares
+// scale solve given placement, d = sum im*|x| / sum im over non-zero lanes,
+// and (b) zero re-placement given d by incremental cost: zeroing lane p
+// instead of coding it as +-d changes the weighted squared error by
+// im[p]*(2*|x[p]|*d - d^2); pick the lane with the smallest increase.
+void quantize_row_stq1_0_im(const float * GGML_RESTRICT x, block_stq1_0 * GGML_RESTRICT y, int64_t k, const float * GGML_RESTRICT im) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        memset(y[i].qs,   0, sizeof(y[i].qs));
+        memset(y[i].sign, 0, sizeof(y[i].sign));
+
+        float w[QK_K];
+        float imp[QK_K];
+        for (int j = 0; j < QK_K; ++j) {
+            w[j]   = x[i*QK_K + j];
+            imp[j] = im[i*QK_K + j] > 0.0f ? im[i*QK_K + j] : 0.0f;
+        }
+
+        int zero_pos[QK_K/4];
+
+        // init placement: min-|x| lane per group
+        for (int g = 0; g < QK_K/4; ++g) {
+            const int chunk = g / 16, gloc = g % 16;
+            int zp = 0;
+            float min_abs = fabsf(w[chunk*64 + gloc]);
+            for (int p = 1; p < 4; ++p) {
+                const float a = fabsf(w[chunk*64 + gloc + p*16]);
+                if (a < min_abs) { min_abs = a; zp = p; }
+            }
+            zero_pos[g] = zp;
+        }
+
+        float d = 0.0f;
+
+        for (int round = 0; round < 3; ++round) {
+            // scale solve given placement
+            double num = 0.0, den = 0.0;
+            for (int g = 0; g < QK_K/4; ++g) {
+                const int chunk = g / 16, gloc = g % 16;
+                for (int p = 0; p < 4; ++p) {
+                    if (p == zero_pos[g]) continue;
+                    const int j = chunk*64 + gloc + p*16;
+                    num += (double) imp[j] * fabsf(w[j]);
+                    den += (double) imp[j];
+                }
+            }
+            d = den > 0.0 ? (float) (num / den) : 0.0f;
+            d = fminf(d, 65504.0f);
+
+            // zero re-placement given d, by incremental cost
+            for (int g = 0; g < QK_K/4; ++g) {
+                const int chunk = g / 16, gloc = g % 16;
+                int zp = 0;
+                float best = FLT_MAX;
+                for (int p = 0; p < 4; ++p) {
+                    const int j = chunk*64 + gloc + p*16;
+                    const float cost = imp[j] * (2.0f*fabsf(w[j])*d - d*d);
+                    if (cost < best) { best = cost; zp = p; }
+                }
+                zero_pos[g] = zp;
+            }
+        }
+
+        // final scale solve with the final placement
+        {
+            double num = 0.0, den = 0.0;
+            for (int g = 0; g < QK_K/4; ++g) {
+                const int chunk = g / 16, gloc = g % 16;
+                for (int p = 0; p < 4; ++p) {
+                    if (p == zero_pos[g]) continue;
+                    const int j = chunk*64 + gloc + p*16;
+                    num += (double) imp[j] * fabsf(w[j]);
+                    den += (double) imp[j];
+                }
+            }
+            d = den > 0.0 ? (float) (num / den) : 0.0f;
+            d = fminf(d, 65504.0f);
+        }
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int g = 0; g < QK_K/4; ++g) {
+            const int chunk = g / 16, gloc = g % 16;
+            const float * base = w + chunk*64 + gloc;
+
+            uint8_t qpack = 0;
+            for (int p = 0; p < 4; ++p) {
+                uint8_t lane;
+                if (p == zero_pos[g]) {
+                    lane = 0x1;
+                } else {
+                    lane = (base[p*16] < 0.0f) ? 0x0 : 0x2;
+                }
+                qpack |= (uint8_t)(lane << (2*p));
+            }
+
+            const uint8_t code = stq1_0_qpack_to_slot[qpack];
+            const uint8_t sign = stq1_0_qpack_to_sign[qpack];
+            assert(code != 0xFF);
+
+            y[i].qs  [g/2] |= (uint8_t)((code & 0x0F) << (4 * (g & 1)));
+            y[i].sign[g/8] |= (uint8_t)(sign << (g % 8));
+        }
+    }
 }
 
 void dequantize_row_tq1_0(const block_tq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
