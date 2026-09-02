@@ -2493,18 +2493,28 @@ static int64_t       g_stq_hessian_n = 0;
 static float       * g_stq_hessian_inv = NULL;   // cache: H^-1, float, row-major
 static const float * g_stq_hinv_src = NULL;      // which H the cache was built from
 
+static void stq_hessian_inv_build(int64_t n);
+
 void quantize_stq1_0_set_hessian(const float * h, int64_t n) {
     g_stq_hessian   = h;
     g_stq_hessian_n = h ? n : 0;
+    g_stq_hinv_src  = NULL; // invalidate the inverse cache on every H change
+    // build the inverse HERE: this setter is called single-threaded once per
+    // tensor by llama-quantize; the row workers below only read the cache.
+    // (quantize_stq1_0 itself can run on several worker threads at once)
+    if (g_stq_hessian != NULL) {
+        stq_hessian_inv_build(g_stq_hessian_n);
+    }
 }
 
-// Build H^-1 (Gauss-Jordan in double, H is SPD after damping). Called at most
-// once per tensor: all expert slices share the same H pointer, and the cache
-// skips repeats. Thread safety: quantize_stq1_0 is entered per slice sequentially
-// before the row-parallel quantization starts (see llama-quant.cpp).
-static const float * stq_hessian_inv(int64_t n) {
-    if (g_stq_hinv_src != g_stq_hessian || !g_stq_hessian_inv) {
-        if (n <= 0) return NULL;
+// Build H^-1 (Gauss-Jordan in double, H is SPD after damping). Must be called
+// from the quantize_stq1_0 entry (single-threaded) BEFORE rows are dispatched:
+// the row workers only read g_stq_hessian_inv.
+static void stq_hessian_inv_build(int64_t n) {
+    if (g_stq_hinv_src == g_stq_hessian && g_stq_hessian_inv) {
+        return;
+    }
+    if (n <= 0) return;
         // augment [H | I] in double, invert in place
         static double * aug = NULL;
         static int64_t aug_n = 0;
@@ -2551,8 +2561,6 @@ static const float * stq_hessian_inv(int64_t n) {
             for (int64_t j = 0; j < n; ++j)
                 g_stq_hessian_inv[i*n + j] = (float) aug[i*2*n + n + j];
         g_stq_hinv_src = g_stq_hessian;
-    }
-    return g_stq_hessian_inv;
 }
 
 size_t quantize_stq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -2561,6 +2569,8 @@ size_t quantize_stq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
         // imatrix-aware encoding: quant_weights[j] is the importance of input
         // column j, shared across all rows (see quantize_row_stq1_0_im)
         const int64_t blocks_per_row = row_size / sizeof(block_stq1_0);
+        // GPTQ: the inverse Hessian is prebuilt by quantize_stq1_0_set_hessian
+        // (single-threaded); rows dispatched below only read it
         for (int64_t r = 0; r < nrow; ++r) {
             quantize_row_stq1_0_im(src + r*n_per_row, (block_stq1_0 *) dst + r*blocks_per_row, n_per_row, quant_weights);
         }
@@ -2703,7 +2713,7 @@ void quantize_row_stq1_0_im(const float * GGML_RESTRICT x, block_stq1_0 * GGML_R
         // Natural column order (no act-order permutation: the block layout
         // fixes the column order in the format).
         if (gptq) {
-            const float * Hinv = stq_hessian_inv(k);
+            const float * Hinv = g_stq_hessian_inv;
             const int64_t off = (i+1) * QK_K; // first not-yet-quantized column
             if (Hinv != NULL && off < k) {
                 for (int64_t j = i*QK_K; j < off; ++j) {

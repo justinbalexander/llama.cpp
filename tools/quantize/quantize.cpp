@@ -533,11 +533,6 @@ int llama_quantize(int argc, char ** argv) {
             kv_overrides.emplace_back(std::move(kvo));
         }
     }
-    if (!kv_overrides.empty()) {
-        kv_overrides.emplace_back();
-        kv_overrides.back().key[0] = 0;
-        params.kv_overrides = kv_overrides.data();
-    }
     if (!gram_file.empty()) {
         llama_model_kv_override kvo;
         std::strcpy(kvo.key, "quantize.gram.file");
@@ -545,6 +540,11 @@ int llama_quantize(int argc, char ** argv) {
         strncpy(kvo.val_str, gram_file.c_str(), 127);
         kvo.val_str[127] = '\0';
         kv_overrides.emplace_back(std::move(kvo));
+    }
+    if (!kv_overrides.empty()) {
+        kv_overrides.emplace_back();
+        kv_overrides.back().key[0] = 0;
+        params.kv_overrides = kv_overrides.data();
     }
 
     if (!tensor_type_opts.empty()) {

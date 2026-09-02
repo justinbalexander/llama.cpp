@@ -348,19 +348,22 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         // GPTQ support: aggregate Gram update from sampled routed activations.
         // One rank-update pass over G per call: buffer up to 32 sampled x vectors,
         // then stream each G row once (G[j,:] += sum_s xs[s][j] * xs[s][:]).
+        // The observer fires many times per chunk, so accumulate only 1 of 16
+        // calls per tensor (still thousands of samples over a full run).
         // Restricted to the broadcast layout (ne[1] == 1) and n <= 2048 (xs buffer size).
+        static std::unordered_map<std::string, uint32_t> s_gram_calls;
         if (m_params.imat_gram_max_n > 0 && src1->ne[0] > 1 && src1->ne[0] <= (int64_t) std::min<int64_t>(m_params.imat_gram_max_n, 2048)
-                && src1->ne[1] == 1) {
+                && src1->ne[1] == 1 && (s_gram_calls[wname]++ & 0x3F) == 0) {
             auto & G = m_grams[wname];
             const int64_t n = src1->ne[0];
             if (G.empty()) {
                 G.assign((size_t) n*n, 0.0f);
             }
             const int64_t ntok = src1->ne[2];
-            const int64_t step = std::max<int64_t>(1, ntok / 32);
+            const int64_t step = std::max<int64_t>(1, ntok / 16);
             int64_t ns = 0;
-            float xs[32 * 2048];
-            for (int64_t row = 0; row < ntok && ns < 32; row += step, ++ns) {
+            float xs[16 * 2048];
+            for (int64_t row = 0; row < ntok && ns < 16; row += step, ++ns) {
                 const float * x = (const float *) (data + row*src1->nb[2]);
                 memcpy(xs + (size_t) ns*n, x, n*sizeof(float));
             }
