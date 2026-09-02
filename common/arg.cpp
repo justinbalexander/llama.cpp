@@ -3053,6 +3053,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
+        {"--gram"}, "MAXN",
+        "collect an aggregated Gram matrix (sum x*x^T) per MoE expert tensor with at most MAXN columns, "
+        "saved as <output>.gram alongside the imatrix (for GPTQ-style quantization; 0 = off, default off)",
+        [](common_params & params, int value) {
+            params.imat_gram_max_n = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
         {"--output-format"}, "{gguf,dat}",
         string_format("output format for imatrix file (default: %s)", params.imat_dat > 0 ? "dat" : "gguf"),
         [](common_params & params, const std::string & value) {

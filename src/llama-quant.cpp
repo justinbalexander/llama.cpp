@@ -3,6 +3,7 @@
 #include "llama-model-loader.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "../ggml/src/ggml-quants.h"
 
 #include <algorithm>
 #include <cmath>
@@ -917,6 +918,45 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     }
     std::unordered_map<std::string, std::vector<float>> i_data;
     const std::unordered_map<std::string, std::vector<float>> * imatrix_data = nullptr;
+
+    // GPTQ support: load the .gram sidecar (aggregated H = sum x x^T per tensor,
+    // produced by llama-imatrix --gram). Applies only to STQ1_0 tensors.
+    std::unordered_map<std::string, std::vector<float>> gram_map;
+    if (params->kv_overrides) {
+        for (const llama_model_kv_override * o = params->kv_overrides; o->key[0] != 0; ++o) {
+            if (o->tag == LLAMA_KV_OVERRIDE_TYPE_STR && strcmp(o->key, "quantize.gram.file") == 0) {
+                std::ifstream in(o->val_str, std::ios::binary);
+                if (!in) {
+                    throw std::runtime_error(format("failed to open gram file %s", o->val_str));
+                }
+                uint32_t magic = 0, ver = 0, ntens = 0;
+                in.read((char *) &magic, 4); in.read((char *) &ver, 4); in.read((char *) &ntens, 4);
+                if (magic != 0x47524d31 || ver != 1) {
+                    throw std::runtime_error(format("bad gram file %s (magic %x ver %d)", o->val_str, magic, ver));
+                }
+                for (uint32_t t = 0; t < ntens; ++t) {
+                    uint32_t nlen = 0, n = 0;
+                    in.read((char *) &nlen, 4);
+                    std::string name(nlen, '\0');
+                    in.read(name.data(), nlen);
+                    in.read((char *) &n, 4);
+                    std::vector<float> g((size_t) n * n);
+                    in.read((char *) g.data(), g.size() * sizeof(float));
+                    // GPTQ damping: H += lambda * mean(diag(H)) * I, lambda = 1%
+                    double sumd = 0.0;
+                    for (uint32_t j = 0; j < n; ++j) sumd += g[(size_t) j*n + j];
+                    const float damp = (float) (0.01 * sumd / std::max<uint32_t>(n, 1));
+                    for (uint32_t j = 0; j < n; ++j) g[(size_t) j*n + j] += damp;
+                    gram_map.emplace(std::move(name), std::move(g));
+                }
+                LLAMA_LOG_INFO("%s: loaded %d Gram matrices from %s (GPTQ compensation enabled for STQ1_0)\n",
+                        __func__, (int) gram_map.size(), o->val_str);
+                break;
+            }
+        }
+    }
+    const std::unordered_map<std::string, std::vector<float>> * gram_data = gram_map.empty() ? nullptr : & gram_map;
+
     if (params->imatrix) {
         for (const llama_model_imatrix_data * p = params->imatrix; p->name != nullptr; p++) {
             i_data.emplace(p->name, std::vector<float>(p->data, p->data + p->size));
@@ -1253,6 +1293,18 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const int64_t nelements_matrix = tensor->ne[0] * tensor->ne[1];
                 const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
                 const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
+
+                // GPTQ support: full Hessian for this tensor from the .gram sidecar, STQ1_0 only
+                if (new_type == GGML_TYPE_STQ1_0 && gram_data) {
+                    auto it = gram_data->find(tensor->name);
+                    if (it != gram_data->end() && it->second.size() == (size_t) n_per_row * n_per_row) {
+                        quantize_stq1_0_set_hessian(it->second.data(), n_per_row);
+                    } else {
+                        quantize_stq1_0_set_hessian(nullptr, 0);
+                    }
+                } else {
+                    quantize_stq1_0_set_hessian(nullptr, 0);
+                }
 
                 // quantize each expert separately since they have different importance matrices
                 new_size = 0;

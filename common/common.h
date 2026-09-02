@@ -698,6 +698,7 @@ struct common_params {
     int32_t n_out_freq  = 10; // output the imatrix every n_out_freq iterations
     int32_t n_save_freq =  0; // save the imatrix every n_save_freq iterations
     int32_t i_chunk     =  0; // start processing from this chunk
+    int32_t imat_gram_max_n = 2048; // collect a full Gram matrix per MoE tensor up to this many columns (0 = off)
     int8_t  imat_dat    =  0; // whether the legacy imatrix.dat format should be output (gguf <= 0 < dat)
 
     bool process_output  = false; // collect data for the output tensor

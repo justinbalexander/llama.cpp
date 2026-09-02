@@ -400,6 +400,7 @@ int llama_quantize(int argc, char ** argv) {
 
     int arg_idx = 1;
     std::string imatrix_file;
+    std::string gram_file;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_type_option> tensor_type_opts;
@@ -451,6 +452,12 @@ int llama_quantize(int argc, char ** argv) {
         } else if (strcmp(argv[arg_idx], "--imatrix") == 0) {
             if (arg_idx < argc-1) {
                 imatrix_file = argv[++arg_idx];
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--gram") == 0) {
+            if (arg_idx < argc-1) {
+                gram_file = argv[++arg_idx];
             } else {
                 usage(argv[0]);
             }
@@ -531,6 +538,15 @@ int llama_quantize(int argc, char ** argv) {
         kv_overrides.back().key[0] = 0;
         params.kv_overrides = kv_overrides.data();
     }
+    if (!gram_file.empty()) {
+        llama_model_kv_override kvo;
+        std::strcpy(kvo.key, "quantize.gram.file");
+        kvo.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
+        strncpy(kvo.val_str, gram_file.c_str(), 127);
+        kvo.val_str[127] = '\0';
+        kv_overrides.emplace_back(std::move(kvo));
+    }
+
     if (!tensor_type_opts.empty()) {
         t_override.reserve(tensor_type_opts.size() + 1);
         for (const auto & tt : tensor_type_opts) {

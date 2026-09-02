@@ -2483,6 +2483,78 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
 // forward: defined after quantize_stq1_0 below
 void quantize_row_stq1_0_im(const float * GGML_RESTRICT x, block_stq1_0 * GGML_RESTRICT y, int64_t k, const float * GGML_RESTRICT im);
 
+// GPTQ support (opt-in): full Hessian proxy for the tensor being quantized.
+// Set per tensor by the caller (llama-quantize) before quantize_chunk; NULL disables.
+// Row-local compensation keeps this safe under the multithreaded row-chunk
+// quantization used by llama-quantize: threads work on disjoint rows and the
+// Hessian is read-only here.
+static const float * g_stq_hessian = NULL;
+static int64_t       g_stq_hessian_n = 0;
+static float       * g_stq_hessian_inv = NULL;   // cache: H^-1, float, row-major
+static const float * g_stq_hinv_src = NULL;      // which H the cache was built from
+
+void quantize_stq1_0_set_hessian(const float * h, int64_t n) {
+    g_stq_hessian   = h;
+    g_stq_hessian_n = h ? n : 0;
+}
+
+// Build H^-1 (Gauss-Jordan in double, H is SPD after damping). Called at most
+// once per tensor: all expert slices share the same H pointer, and the cache
+// skips repeats. Thread safety: quantize_stq1_0 is entered per slice sequentially
+// before the row-parallel quantization starts (see llama-quant.cpp).
+static const float * stq_hessian_inv(int64_t n) {
+    if (g_stq_hinv_src != g_stq_hessian || !g_stq_hessian_inv) {
+        if (n <= 0) return NULL;
+        // augment [H | I] in double, invert in place
+        static double * aug = NULL;
+        static int64_t aug_n = 0;
+        if (aug_n < 2*n) {
+            free(aug);
+            aug = malloc((size_t) 2*n*n * sizeof(double));
+            aug_n = 2*n;
+        }
+        for (int64_t i = 0; i < n; ++i) {
+            for (int64_t j = 0; j < n; ++j) {
+                aug[i*2*n + j]     = (i == j) ? (double) g_stq_hessian[i*n + j] + 1e-6 : (double) g_stq_hessian[i*n + j];
+                aug[i*2*n + n + j] = (i == j) ? 1.0 : 0.0;
+            }
+        }
+        for (int64_t col = 0; col < n; ++col) {
+            // partial pivot
+            int64_t piv = col;
+            double best = fabs(aug[col*2*n + col]);
+            for (int64_t r = col+1; r < n; ++r) {
+                const double v = fabs(aug[r*2*n + col]);
+                if (v > best) { best = v; piv = r; }
+            }
+            if (best == 0.0) { // singular column: identity row, skip
+                for (int64_t j = 0; j < 2*n; ++j) aug[col*2*n + j] = (col == j) ? 1.0 : 0.0;
+                continue;
+            }
+            if (piv != col) {
+                for (int64_t j = 0; j < 2*n; ++j) {
+                    const double t = aug[col*2*n + j]; aug[col*2*n + j] = aug[piv*2*n + j]; aug[piv*2*n + j] = t;
+                }
+            }
+            const double d = aug[col*2*n + col];
+            for (int64_t j = 0; j < 2*n; ++j) aug[col*2*n + j] /= d;
+            for (int64_t r = 0; r < n; ++r) {
+                if (r == col) continue;
+                const double f = aug[r*2*n + col];
+                if (f == 0.0) continue;
+                for (int64_t j = 0; j < 2*n; ++j) aug[r*2*n + j] -= f * aug[col*2*n + j];
+            }
+        }
+        free(g_stq_hessian_inv);
+        g_stq_hessian_inv = malloc((size_t) n*n * sizeof(float));
+        for (int64_t i = 0; i < n; ++i)
+            for (int64_t j = 0; j < n; ++j)
+                g_stq_hessian_inv[i*n + j] = (float) aug[i*2*n + n + j];
+        g_stq_hinv_src = g_stq_hessian;
+    }
+    return g_stq_hessian_inv;
+}
+
 size_t quantize_stq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     const size_t row_size = ggml_row_size(GGML_TYPE_STQ1_0, n_per_row);
     if (quant_weights != NULL) {
@@ -2522,16 +2594,21 @@ void quantize_row_stq1_0_im(const float * GGML_RESTRICT x, block_stq1_0 * GGML_R
     assert(k % QK_K == 0);
     const int64_t nb = k / QK_K;
 
+    // working copy: GPTQ compensation edits not-yet-quantized columns in place
+    // (largest supported row: 16384 columns)
+    float w[16384];
+    float imp[16384];
+    assert(k <= 16384);
+    for (int j = 0; j < k; ++j) {
+        w[j]   = x[j];
+        imp[j] = im[j] > 0.0f ? im[j] : 0.0f;
+    }
+
+    const bool gptq = (g_stq_hessian != NULL) && (g_stq_hessian_n == k);
+
     for (int64_t i = 0; i < nb; ++i) {
         memset(y[i].qs,   0, sizeof(y[i].qs));
         memset(y[i].sign, 0, sizeof(y[i].sign));
-
-        float w[QK_K];
-        float imp[QK_K];
-        for (int j = 0; j < QK_K; ++j) {
-            w[j]   = x[i*QK_K + j];
-            imp[j] = im[i*QK_K + j] > 0.0f ? im[i*QK_K + j] : 0.0f;
-        }
 
         int zero_pos[QK_K/4];
 
@@ -2539,9 +2616,9 @@ void quantize_row_stq1_0_im(const float * GGML_RESTRICT x, block_stq1_0 * GGML_R
         for (int g = 0; g < QK_K/4; ++g) {
             const int chunk = g / 16, gloc = g % 16;
             int zp = 0;
-            float min_abs = fabsf(w[chunk*64 + gloc]);
+            float min_abs = fabsf(w[i*QK_K + chunk*64 + gloc]);
             for (int p = 1; p < 4; ++p) {
-                const float a = fabsf(w[chunk*64 + gloc + p*16]);
+                const float a = fabsf(w[i*QK_K + chunk*64 + gloc + p*16]);
                 if (a < min_abs) { min_abs = a; zp = p; }
             }
             zero_pos[g] = zp;
@@ -2556,7 +2633,7 @@ void quantize_row_stq1_0_im(const float * GGML_RESTRICT x, block_stq1_0 * GGML_R
                 const int chunk = g / 16, gloc = g % 16;
                 for (int p = 0; p < 4; ++p) {
                     if (p == zero_pos[g]) continue;
-                    const int j = chunk*64 + gloc + p*16;
+                    const int j = i*QK_K + chunk*64 + gloc + p*16;
                     num += (double) imp[j] * fabsf(w[j]);
                     den += (double) imp[j];
                 }
@@ -2570,7 +2647,7 @@ void quantize_row_stq1_0_im(const float * GGML_RESTRICT x, block_stq1_0 * GGML_R
                 int zp = 0;
                 float best = FLT_MAX;
                 for (int p = 0; p < 4; ++p) {
-                    const int j = chunk*64 + gloc + p*16;
+                    const int j = i*QK_K + chunk*64 + gloc + p*16;
                     const float cost = imp[j] * (2.0f*fabsf(w[j])*d - d*d);
                     if (cost < best) { best = cost; zp = p; }
                 }
@@ -2585,7 +2662,7 @@ void quantize_row_stq1_0_im(const float * GGML_RESTRICT x, block_stq1_0 * GGML_R
                 const int chunk = g / 16, gloc = g % 16;
                 for (int p = 0; p < 4; ++p) {
                     if (p == zero_pos[g]) continue;
-                    const int j = chunk*64 + gloc + p*16;
+                    const int j = i*QK_K + chunk*64 + gloc + p*16;
                     num += (double) imp[j] * fabsf(w[j]);
                     den += (double) imp[j];
                 }
@@ -2598,7 +2675,7 @@ void quantize_row_stq1_0_im(const float * GGML_RESTRICT x, block_stq1_0 * GGML_R
 
         for (int g = 0; g < QK_K/4; ++g) {
             const int chunk = g / 16, gloc = g % 16;
-            const float * base = w + chunk*64 + gloc;
+            const float * base = w + i*QK_K + chunk*64 + gloc;
 
             uint8_t qpack = 0;
             for (int p = 0; p < 4; ++p) {
@@ -2617,6 +2694,38 @@ void quantize_row_stq1_0_im(const float * GGML_RESTRICT x, block_stq1_0 * GGML_R
 
             y[i].qs  [g/2] |= (uint8_t)((code & 0x0F) << (4 * (g & 1)));
             y[i].sign[g/8] |= (uint8_t)(sign << (g % 8));
+        }
+
+        // GPTQ error compensation (row-local): after block i is fixed, push its
+        // quantization residual into the not-yet-quantized columns of this row
+        // using the INVERSE Hessian (GPTQ / OBQ update rule):
+        //   w[k] -= r[j] * Hinv[j][k] / Hinv[j][j]
+        // Natural column order (no act-order permutation: the block layout
+        // fixes the column order in the format).
+        if (gptq) {
+            const float * Hinv = stq_hessian_inv(k);
+            const int64_t off = (i+1) * QK_K; // first not-yet-quantized column
+            if (Hinv != NULL && off < k) {
+                for (int64_t j = i*QK_K; j < off; ++j) {
+                    const float hjj = Hinv[j*k + j];
+                    if (hjj <= 0.0f || !isfinite(hjj)) continue;
+                    float wq;
+                    {
+                        const int64_t jj  = j - i*QK_K;
+                        const int chunk  = jj / 64, jl = jj % 64;
+                        const int g      = chunk*16 + jl % 16, p = jl / 16;
+                        const float dd   = GGML_FP16_TO_FP32(y[i].d);
+                        wq = (p == zero_pos[g]) ? 0.0f : (w[j] < 0.0f ? -dd : dd);
+                    }
+                    const float r = w[j] - wq;
+                    if (r == 0.0f) continue;
+                    const float * hrow = Hinv + j*k;
+                    const float f = r / hjj;
+                    for (int64_t kk2 = off; kk2 < k; ++kk2) {
+                        w[kk2] -= f * hrow[kk2];
+                    }
+                }
+            }
         }
     }
 }

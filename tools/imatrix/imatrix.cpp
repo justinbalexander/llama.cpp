@@ -72,6 +72,12 @@ private:
     int32_t                                m_last_chunk = 0;
     std::vector<char>                      m_src1_data;
     std::vector<char>                      m_ids; // the expert ids from ggml_mul_mat_id
+    // GPTQ support: aggregated Gram matrix per MoE tensor, sum over sampled
+    // routed activation vectors of x*x^T. One matrix per tensor (not per expert):
+    // per-expert Grams would need ne2 * n^2 floats (e.g. 33 GB for LFM2-8B).
+    // Aggregation ignores the routing-selection bias between experts.
+    std::unordered_map<std::string, std::vector<float>> m_grams;
+    void save_gram() const;
 };
 
 // remove any prefix and suffixes from the name
@@ -338,6 +344,38 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                 }
             }
         }
+
+        // GPTQ support: aggregate Gram update from sampled routed activations.
+        // One rank-update pass over G per call: buffer up to 32 sampled x vectors,
+        // then stream each G row once (G[j,:] += sum_s xs[s][j] * xs[s][:]).
+        // Restricted to the broadcast layout (ne[1] == 1) and n <= 2048 (xs buffer size).
+        if (m_params.imat_gram_max_n > 0 && src1->ne[0] > 1 && src1->ne[0] <= (int64_t) std::min<int64_t>(m_params.imat_gram_max_n, 2048)
+                && src1->ne[1] == 1) {
+            auto & G = m_grams[wname];
+            const int64_t n = src1->ne[0];
+            if (G.empty()) {
+                G.assign((size_t) n*n, 0.0f);
+            }
+            const int64_t ntok = src1->ne[2];
+            const int64_t step = std::max<int64_t>(1, ntok / 32);
+            int64_t ns = 0;
+            float xs[32 * 2048];
+            for (int64_t row = 0; row < ntok && ns < 32; row += step, ++ns) {
+                const float * x = (const float *) (data + row*src1->nb[2]);
+                memcpy(xs + (size_t) ns*n, x, n*sizeof(float));
+            }
+            for (int64_t j = 0; j < n; ++j) {
+                float * grow = G.data() + (size_t) j*n;
+                for (int64_t s = 0; s < ns; ++s) {
+                    const float xj = xs[(size_t) s*n + j];
+                    if (xj == 0.0f) continue;
+                    const float * xr = xs + (size_t) s*n;
+                    for (int64_t k = 0; k < n; ++k) {
+                        grow[k] += xj * xr[k];
+                    }
+                }
+            }
+        }
     } else {
         auto & e = m_stats[wname];
         const int64_t n_mat = src0->ne[2] * src0->ne[3];
@@ -510,9 +548,45 @@ void IMatrixCollector::save_imatrix_legacy(int32_t ncall) const {
     LOG_DBGV(1, "%s: stored collected data after %d chunks in %s\n", __func__, m_last_chunk, fname.c_str());
 }
 
+void IMatrixCollector::save_gram() const {
+    if (m_grams.empty() || m_params.imat_gram_max_n <= 0) {
+        return;
+    }
+    std::string fname = m_params.out_file;
+    if (string_ends_with(fname, ".gguf")) {
+        fname = fname.substr(0, fname.size() - 5);
+    }
+    fname += ".gram";
+    std::ofstream out(fname, std::ios::binary);
+    if (!out) {
+        LOG_ERR("%s: failed to open %s for writing\n", __func__, fname.c_str());
+        return;
+    }
+    const uint32_t magic = 0x47524d31; // "1MRG"
+    const uint32_t ver   = 1;
+    const uint32_t ntens = (uint32_t) m_grams.size();
+    out.write((const char *) &magic, sizeof(magic));
+    out.write((const char *) &ver,   sizeof(ver));
+    out.write((const char *) &ntens, sizeof(ntens));
+    for (const auto & kv : m_grams) {
+        const uint32_t nlen = (uint32_t) kv.first.size();
+        const uint64_t nelem = kv.second.size();
+        const uint32_t n    = (uint32_t) std::lround(std::sqrt((double) nelem));
+        out.write((const char *) &nlen, sizeof(nlen));
+        out.write(kv.first.data(), nlen);
+        out.write((const char *) &n,   sizeof(n));
+        if (nelem) {
+            out.write((const char *) kv.second.data(), nelem * sizeof(float));
+        }
+    }
+    LOG_INF("%s: saved %d Gram matrices to %s\n", __func__, ntens, fname.c_str());
+}
+
 void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
     auto fname = m_params.out_file;
     int8_t use_legacy_format = m_params.imat_dat;
+
+    save_gram();
 
     if (use_legacy_format > 0) {
         this->save_imatrix_legacy(n_chunk);

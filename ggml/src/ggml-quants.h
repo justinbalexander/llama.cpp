@@ -67,6 +67,11 @@ GGML_API void dequantize_row_tq1_0(const block_tq1_0 * GGML_RESTRICT x, float * 
 GGML_API void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_stq1_0(const block_stq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
+// GPTQ support: set the Hessian proxy for the tensor about to be quantized
+// with quantize_stq1_0. h == NULL disables compensation. Read-only during
+// quantization; must be set before each ggml_quantize_chunk call.
+GGML_API void quantize_stq1_0_set_hessian(const float * h, int64_t n);
+
 GGML_API void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_iq2_xs (const block_iq2_xs  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_iq2_s  (const block_iq2_s   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
