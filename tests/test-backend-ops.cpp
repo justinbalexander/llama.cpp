@@ -9995,7 +9995,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_STQ1_0, GGML_TYPE_F32, 128, 8, b, 512, 32, 2048));
     }
 
-||||||| 74ce15741
 
     // Test IQP panel path for all grid IQ types
     for (ggml_type type_a : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
