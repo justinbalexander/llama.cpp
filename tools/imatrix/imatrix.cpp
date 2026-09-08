@@ -349,23 +349,54 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         // One rank-update pass over G per call: buffer up to 32 sampled x vectors,
         // then stream each G row once (G[j,:] += sum_s xs[s][j] * xs[s][:]).
         // The observer fires many times per chunk, so accumulate only 1 of 16
-        // calls per tensor (still thousands of samples over a full run).
-        // Restricted to the broadcast layout (ne[1] == 1) and n <= 2048 (xs buffer size).
+        // calls per tensor (still thousands of samples over a full run;
+        // the & 0x3F mask keeps 1 call in 64).
+        // Two layouts are handled:
+        //   - broadcast (ne[1] == 1): gate/up experts and dense tensors;
+        //   - routed (ne[1] != 1, e.g. top-k selected rows): down-proj experts,
+        //     where the Hessian rows are the per-expert ROUTED activations;
+        //     sampled evenly across experts from the same (ex, idx, row) space
+        //     the importance loop above walks.
         static std::unordered_map<std::string, uint32_t> s_gram_calls;
-        if (m_params.imat_gram_max_n > 0 && src1->ne[0] > 1 && src1->ne[0] <= (int64_t) std::min<int64_t>(m_params.imat_gram_max_n, 2048)
-                && src1->ne[1] == 1 && (s_gram_calls[wname]++ & 0x3F) == 0) {
+        const int64_t gmax = std::min<int64_t>(m_params.imat_gram_max_n, 2048);
+        if (m_params.imat_gram_max_n > 0 && src1->ne[0] > 1 && src1->ne[0] <= gmax
+                && (s_gram_calls[wname]++ & 0x3F) == 0) {
             auto & G = m_grams[wname];
             const int64_t n = src1->ne[0];
             if (G.empty()) {
                 G.assign((size_t) n*n, 0.0f);
             }
             const int64_t ntok = src1->ne[2];
-            const int64_t step = std::max<int64_t>(1, ntok / 16);
             int64_t ns = 0;
             float xs[16 * 2048];
-            for (int64_t row = 0; row < ntok && ns < 16; row += step, ++ns) {
-                const float * x = (const float *) (data + row*src1->nb[2]);
-                memcpy(xs + (size_t) ns*n, x, n*sizeof(float));
+            if (src1->ne[1] == 1) {
+                const int64_t step = std::max<int64_t>(1, ntok / 16);
+                for (int64_t row = 0; row < ntok && ns < 16; row += step, ++ns) {
+                    const float * x = (const float *) (data + row*src1->nb[2]);
+                    memcpy(xs + (size_t) ns*n, x, n*sizeof(float));
+                }
+            } else {
+                // routed layout: at most 16/n_as + 1 rows per expert, spread
+                // across the (idx, row) space, rotating the starting expert
+                // by call counter so all experts get sampled over many calls
+                const int64_t per_exp = std::max<int64_t>(1, 16 / n_as);
+                const int64_t step = std::max<int64_t>(1, ntok / (per_exp + 1));
+                const int64_t ex0 = (s_gram_calls[wname] >> 6) % n_as;
+                for (int64_t exi = 0; exi < n_as && ns < 16; ++exi) {
+                    const int64_t ex = (ex0 + exi) % n_as;
+                    int64_t taken = 0;
+                    for (int64_t idx = 0; idx < n_ids && taken < per_exp && ns < 16; ++idx) {
+                        for (int64_t row = 0; row < ntok && taken < per_exp && ns < 16; row += step) {
+                            const int excur = *(const int32_t *) (m_ids.data() + row*ids->nb[1] + idx*ids->nb[0]);
+                            if (excur != ex) continue;
+                            const int64_t i11 = idx % src1->ne[1];
+                            const int64_t i12 = row;
+                            const float * x = (const float *) (data + i11*src1->nb[1] + i12*src1->nb[2]);
+                            memcpy(xs + (size_t) ns*n, x, n*sizeof(float));
+                            ++ns; ++taken;
+                        }
+                    }
+                }
             }
             for (int64_t j = 0; j < n; ++j) {
                 float * grow = G.data() + (size_t) j*n;
