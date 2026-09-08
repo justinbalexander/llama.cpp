@@ -1537,6 +1537,33 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// --- STQ F6: expert-selection counters per MoE matmul (env-gated) ---
+// Enabled only when STQ_ROUTER_LOG is set to an output path; the dump is
+// written at process exit. Slot order = first-seen order = layer order.
+#define STQ_RT_MAX_SLOTS 256
+#define STQ_RT_MAX_EXPERTS 256
+struct stq_router_slot {
+    const void * wptr;
+    int n_expert;
+    uint64_t counts[STQ_RT_MAX_EXPERTS];
+};
+static struct stq_router_slot stq_rt_slots[STQ_RT_MAX_SLOTS];
+static int stq_rt_nslots = 0;
+static int stq_rt_env = -1; // -1 unknown, 0 off, 1 on
+
+static void stq_rt_dump(void) {
+    const char * p = getenv("STQ_ROUTER_LOG");
+    if (!p) return;
+    FILE * f = fopen(p, "wb");
+    if (!f) return;
+    fwrite(&stq_rt_nslots, sizeof(int), 1, f);
+    for (int i = 0; i < stq_rt_nslots; ++i) {
+        fwrite(&stq_rt_slots[i].n_expert, sizeof(int), 1, f);
+        fwrite(stq_rt_slots[i].counts, sizeof(uint64_t), stq_rt_slots[i].n_expert, f);
+    }
+    fclose(f);
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1639,6 +1666,34 @@ static void ggml_compute_forward_mul_mat_id(
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
+        }
+
+        if (stq_rt_env == -1) {
+            stq_rt_env = getenv("STQ_ROUTER_LOG") ? 1 : 0;
+            if (stq_rt_env) atexit(stq_rt_dump);
+        }
+        // NOTE: single-threaded context only (llama-perplexity); not safe for
+        // parallel server slots. One slot per expert weight tensor: a MoE layer
+        // with separate gate/up/down registers 3 slots with identical counts.
+        if (stq_rt_env && n_as <= STQ_RT_MAX_EXPERTS) {
+            int s;
+            for (s = 0; s < stq_rt_nslots; ++s)
+                if (stq_rt_slots[s].wptr == src0->data) break;
+            if (s == stq_rt_nslots && stq_rt_nslots < STQ_RT_MAX_SLOTS) {
+                stq_rt_slots[s].wptr = src0->data;
+                stq_rt_slots[s].n_expert = n_as;
+                memset(stq_rt_slots[s].counts, 0, sizeof(stq_rt_slots[s].counts));
+                stq_rt_nslots++;
+            } else if (s == stq_rt_nslots) {
+                static bool warned_slots = false;
+                if (!warned_slots) { fprintf(stderr, "STQ_ROUTER_LOG: slot table full, dropping tensors\n"); warned_slots = true; }
+            }
+            if (s < stq_rt_nslots)
+                for (int a = 0; a < n_as; ++a)
+                    stq_rt_slots[s].counts[a] += (uint64_t) matrix_row_counts[a];
+        } else if (stq_rt_env && n_as > STQ_RT_MAX_EXPERTS) {
+            static bool warned_exp = false;
+            if (!warned_exp) { fprintf(stderr, "STQ_ROUTER_LOG: n_expert %d > %d, skipping\n", n_as, STQ_RT_MAX_EXPERTS); warned_exp = true; }
         }
     }
 
