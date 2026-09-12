@@ -3130,6 +3130,7 @@ static int ggml_cpu_try_fuse_ops(
         const int node_n,
         const struct ggml_compute_params * params,
         const struct ggml_cplan * cplan) {
+    if (getenv("STQ_NO_FUSE")) return 0;  // probe-geo: keep norm nodes un-fused
 
     if (ggml_cpu_disable_fusion || cplan->use_ref) {
         return 0;
@@ -3449,6 +3450,58 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
 
+
+// --- STQ probe-geo: per-layer residual capture (env-gated) ---
+// STQ_RESIDUAL_LOG=<path>: after each graph compute, append a record
+// for every ^blk.N.attn_norm tensor (the RMS-normed residual stream
+// entering block N+1). Per tensor: layer, dim, mean-pooled row + final
+// row (2*dim f32) — pooling in-hook keeps dumps small. One record set
+// per graph eval = one llama_decode call in the driver.
+static FILE * stq_resid_f = NULL;
+static int stq_resid_env = -1;
+static void stq_resid_capture(struct ggml_cgraph * cgraph) {
+    if (stq_resid_env < 0) {
+        const char * p = getenv("STQ_RESIDUAL_LOG");
+        stq_resid_env = 0;
+        if (p) { stq_resid_f = fopen(p, "wb"); if (stq_resid_f) stq_resid_env = 1; }
+    }
+    if (!stq_resid_env) return;
+    int n_cap = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        struct ggml_tensor * t = cgraph->nodes[i];
+        int layer = -1;
+        // LFM2: "model.layers.{}.operator_norm-<il>" (GGML_OP_MUL = weighted
+        // RMS-norm of the residual stream entering block il; braces literal)
+        if (t->op == GGML_OP_MUL && t->type == GGML_TYPE_F32 && t->ne[2] == 1 && t->ne[3] == 1 &&
+                sscanf(t->name, "model.layers.{}.operator_norm-%d", &layer) == 1) {
+            n_cap++;
+        }
+    }
+    if (n_cap == 0) return;
+    fwrite(&n_cap, sizeof(int), 1, stq_resid_f);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        struct ggml_tensor * t = cgraph->nodes[i];
+        int layer = -1;
+        if (t->op != GGML_OP_MUL || t->type != GGML_TYPE_F32 || t->ne[2] != 1 || t->ne[3] != 1 ||
+                sscanf(t->name, "model.layers.{}.operator_norm-%d", &layer) != 1) {
+            continue;
+        }
+        const int64_t dim = t->ne[0];
+        const int64_t seq = t->ne[1];
+        const float * d = (const float *) t->data;
+        int32_t l32 = (int32_t) layer, d32 = (int32_t) dim;
+        fwrite(&l32, 4, 1, stq_resid_f);
+        fwrite(&d32, 4, 1, stq_resid_f);
+        float * pool = (float *) calloc(2 * dim, sizeof(float));
+        for (int64_t r = 0; r < seq; ++r)
+            for (int64_t c = 0; c < dim; ++c) pool[c] += d[r * dim + c];
+        for (int64_t c = 0; c < dim; ++c) { pool[c] /= (float) seq; pool[dim + c] = d[(seq - 1) * dim + c]; }
+        fwrite(pool, sizeof(float), 2 * dim, stq_resid_f);
+        free(pool);
+    }
+    fflush(stq_resid_f);
+}
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
 
@@ -3516,6 +3569,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+
+    stq_resid_capture(cgraph);
 
     enum ggml_status ret = threadpool->ec;
 
